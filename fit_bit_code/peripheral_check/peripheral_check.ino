@@ -8,7 +8,7 @@
 
 #define SDA_PIN 8
 #define SCL_PIN 9
-#define MAX_EN_PIN 4  // Set to your schematic's MAX30102 / 1.8V LDO EN GPIO
+#define MAX_EN_PIN 4  // MAX30102 / 1.8V LDO EN GPIO
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
