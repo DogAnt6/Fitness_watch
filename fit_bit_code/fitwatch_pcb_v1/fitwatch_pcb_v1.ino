@@ -6,11 +6,14 @@
 //  HR:      MAX30102 (I2C 0x57)
 //  Time:    NTP → ESP32-S3 internal RTC (no external RTC)
 //  Power:   MAX30102 gated via RT9742 (GPIO4)
+//
+//  v1.1: WiFi/NTP sync is now NON-BLOCKING (state machine).
 // =====================================================
 
 #include <Wire.h>
 #include <WiFi.h>
 #include <time.h>
+#include "esp_sntp.h"
 
 // OLED
 #include <Adafruit_GFX.h>
@@ -27,14 +30,14 @@
 // ─────────────────────────────────────────
 //  WiFi credentials
 // ─────────────────────────────────────────
-const char* ssid     = "BillovousUpstairs";
-const char* password = "Upstairs37";
+const char* ssid     = "Anthony ";
+const char* password = "Pineapple";
 
 // ─────────────────────────────────────────
 //  NTP settings (Toronto EDT = UTC-4)
 // ─────────────────────────────────────────
 const char* ntpServer     = "pool.ntp.org";
-const long  gmtOffset_sec = -14400;  // UTC-4 EDT
+const long  gmtOffset_sec = -18000;  // UTC-4 EDT
 const int   daylightOffset = 0;
 
 // ─────────────────────────────────────────
@@ -44,8 +47,8 @@ const int   daylightOffset = 0;
 #define SCL_PIN          9   // I2C SCL
 #define BUTTON_PIN      14   // Screen cycle button (active LOW)
 #define MAX30102_EN_PIN  4   // RT9742 enable (HIGH = sensor on)
-#define INT_HR_PIN       5   // MAX30102 interrupt 
-#define INT_IMU_PIN      6   // MPU-6500 interrupt 
+#define INT_HR_PIN       5   // MAX30102 interrupt
+#define INT_IMU_PIN      6   // MPU-6500 interrupt
 #define BAT_LVL_PIN      1   // Battery voltage divider (ADC1_CH6)
 
 // ─────────────────────────────────────────
@@ -94,22 +97,35 @@ unsigned long lastStepTime   = 0;
 int lastDay = -1;
 
 // ─────────────────────────────────────────
-//  NTP re-sync (every 24 hours)
+//  Non-blocking time sync (WiFi + NTP)
 // ─────────────────────────────────────────
-unsigned long lastNTPSync = 0;
-const unsigned long NTP_RESYNC_INTERVAL = 86400000UL; // 24 hours in ms
+enum SyncState { SYNC_IDLE, SYNC_WIFI_CONNECTING, SYNC_NTP_WAITING };
+SyncState syncState = SYNC_IDLE;
+
+unsigned long syncStateStart = 0;   // when current state began
+unsigned long lastNTPSync    = 0;   // millis() of last success (0 = never)
+unsigned long nextSyncAt     = 0;   // millis() when next attempt is allowed
+
+const unsigned long WIFI_TIMEOUT_MS     = 15000UL;     // give up on WiFi
+const unsigned long NTP_TIMEOUT_MS      = 10000UL;     // give up on NTP
+const unsigned long NTP_RESYNC_INTERVAL = 86400000UL;  // 24 h after success
+const unsigned long NTP_RETRY_INTERVAL  = 300000UL;    // 5 min after failure
+
+volatile bool ntpSyncedFlag = false;  // set by SNTP callback
+
+void onTimeSynced(struct timeval* tv) {
+  ntpSyncedFlag = true;
+}
 
 // ─────────────────────────────────────────
 //  Battery
 // ─────────────────────────────────────────
-// Voltage divider: 330kΩ / 100kΩ → ratio 0.2325
 const float DIVIDER_RATIO = 0.7674;
 int batteryPercent = 0;
 
 // ─────────────────────────────────────────
 //  Button + screens
 // ─────────────────────────────────────────
-#define BUTTON_PIN      14
 int currentScreen = 0;
 // 0 = watch face
 // 1 = steps
@@ -124,12 +140,20 @@ String padZero(int val) {
 }
 
 // ─────────────────────────────────────────
+//  Helper — read RTC WITHOUT blocking.
+//  getLocalTime() defaults to a 5 second wait when the
+//  time isn't set, which froze the whole loop offline.
+// ─────────────────────────────────────────
+bool getTimeNow(struct tm* info) {
+  return getLocalTime(info, 0);
+}
+
+// ─────────────────────────────────────────
 //  Read battery voltage via ADC
 // ─────────────────────────────────────────
 float readBatteryVoltage() {
   pinMode(BAT_LVL_PIN, INPUT);
   analogSetPinAttenuation(BAT_LVL_PIN, ADC_11db);
-  // Average 10 readings for stability
   int sum = 0;
   for (int i = 0; i < 10; i++) {
     sum += analogRead(BAT_LVL_PIN);
@@ -149,75 +173,64 @@ void updateBatteryPercent() {
 }
 
 // ─────────────────────────────────────────
-//  NTP sync → ESP32-S3 internal RTC
+//  Non-blocking NTP sync → internal RTC
 // ─────────────────────────────────────────
-bool syncTimeFromNTP() {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println("Connecting WiFi...");
-  display.println(ssid);
-  display.display();
+void startTimeSync() {
+  if (syncState != SYNC_IDLE) return;
+  Serial.println("Time sync: starting WiFi...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);   // returns immediately
+  syncState      = SYNC_WIFI_CONNECTING;
+  syncStateStart = millis();
+}
 
-  WiFi.begin(ssid, password);
-
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    attempts++;
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("WiFi failed.");
-    display.println("No time sync.");
-    display.display();
-    delay(2000);
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-    return false;
-  }
-
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.println("WiFi connected!");
-  display.println("Syncing time...");
-  display.display();
-
-  // Sync NTP → ESP32-S3 internal RTC
-  configTime(gmtOffset_sec, daylightOffset, ntpServer);
-
-  struct tm timeinfo;
-  int timeout = 0;
-  while (!getLocalTime(&timeinfo) && timeout < 10) {
-    delay(1000);
-    timeout++;
-  }
-
+void finishTimeSync(bool success) {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
+  syncState = SYNC_IDLE;
 
-  if (timeout < 10) {
+  if (success) {
     lastNTPSync = millis();
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("Time synced!");
-    display.printf("%02d:%02d:%02d",
-      timeinfo.tm_hour,
-      timeinfo.tm_min,
-      timeinfo.tm_sec);
-    display.display();
-    delay(1500);
-    return true;
+    if (lastNTPSync == 0) lastNTPSync = 1;  // 0 is reserved for "never"
+    nextSyncAt  = millis() + NTP_RESYNC_INTERVAL;
+    Serial.println("Time sync: success");
   } else {
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("NTP timed out.");
-    display.display();
-    delay(1500);
-    return false;
+    nextSyncAt  = millis() + NTP_RETRY_INTERVAL;
+    Serial.println("Time sync: failed, will retry later");
+  }
+}
+
+// Call every loop() — does a tiny bit of work and returns
+void updateTimeSync() {
+  switch (syncState) {
+
+    case SYNC_IDLE:
+      // Start a new attempt when it's due (retries/resyncs happen automatically)
+      if ((long)(millis() - nextSyncAt) >= 0) startTimeSync();
+      break;
+
+    case SYNC_WIFI_CONNECTING:
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("Time sync: WiFi up, requesting NTP...");
+        ntpSyncedFlag = false;
+        sntp_set_time_sync_notification_cb(onTimeSynced);
+        configTime(gmtOffset_sec, daylightOffset, ntpServer);
+        syncState      = SYNC_NTP_WAITING;
+        syncStateStart = millis();
+      } else if (millis() - syncStateStart > WIFI_TIMEOUT_MS) {
+        Serial.println("Time sync: WiFi timeout");
+        finishTimeSync(false);
+      }
+      break;
+
+    case SYNC_NTP_WAITING:
+      if (ntpSyncedFlag) {
+        finishTimeSync(true);
+      } else if (millis() - syncStateStart > NTP_TIMEOUT_MS) {
+        Serial.println("Time sync: NTP timeout");
+        finishTimeSync(false);
+      }
+      break;
   }
 }
 
@@ -226,7 +239,7 @@ bool syncTimeFromNTP() {
 // ─────────────────────────────────────────
 void checkMidnightReset() {
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) return;  // skip if time not set
+  if (!getTimeNow(&timeinfo)) return;  // skip if time not set
 
   if (lastDay == -1) {
     lastDay = timeinfo.tm_mday;
@@ -254,7 +267,6 @@ void enableHeartSensor() {
     particleSensor.setPulseAmplitudeRed(0x0A);
     particleSensor.setPulseAmplitudeGreen(0);
 
-    // Prefill HR buffer
     for (byte i = 0; i < HR_SAMPLE_SIZE; i++) hrRates[i] = 0;
     hrRateSpot     = 0;
     beatAvg        = 0;
@@ -290,7 +302,6 @@ void updateHeartRate() {
 
   fingerDetected = irValue > FINGER_THRESHOLD;
 
-  // No finger → reset measurement
   if (!fingerDetected) {
     beatAvg = 0;
     beatsPerMinute = 0;
@@ -300,11 +311,9 @@ void updateHeartRate() {
     return;
   }
 
-  // Check for heartbeat
   if (checkForBeat(irValue)) {
     unsigned long now = millis();
 
-    // Ignore first beat because there is no previous beat
     if (lastBeatTime == 0) {
       lastBeatTime = now;
       return;
@@ -316,25 +325,18 @@ void updateHeartRate() {
     if (delta > 0) {
       beatsPerMinute = 60000.0 / delta;
 
-      // Accept reasonable heart-rate measurements
       if (beatsPerMinute > 40 && beatsPerMinute < 200) {
-
-        // Store newest real BPM
         hrRates[hrRateSpot] = (byte)beatsPerMinute;
         hrRateSpot = (hrRateSpot + 1) % HR_SAMPLE_SIZE;
 
-        // Count valid measurements until buffer is full
         if (hrRateCount < HR_SAMPLE_SIZE) {
           hrRateCount++;
         }
 
-        // Average only real measurements
         int sum = 0;
-
         for (byte i = 0; i < hrRateCount; i++) {
           sum += hrRates[i];
         }
-
         beatAvg = sum / hrRateCount;
       }
     }
@@ -375,11 +377,10 @@ void detectStep() {
 // ─────────────────────────────────────────
 void drawWatchFace() {
   struct tm timeinfo;
-  bool timeValid = getLocalTime(&timeinfo);
+  bool timeValid = getTimeNow(&timeinfo);
 
   display.clearDisplay();
 
-  // Time
   display.setTextSize(2);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(4, 4);
@@ -399,7 +400,6 @@ void drawWatchFace() {
     display.setCursor(110, 6);
     display.print(ampm);
 
-    // Date
     display.setCursor(20, 28);
     display.printf("%04d-%02d-%02d",
       timeinfo.tm_year + 1900,
@@ -409,19 +409,16 @@ void drawWatchFace() {
     display.print("--:--:--");
     display.setTextSize(1);
     display.setCursor(0, 28);
-    display.print("Time not set");
+    display.print(syncState != SYNC_IDLE ? "Syncing time..." : "Time not set");
   }
 
-  // Divider
   display.drawLine(0, 38, 127, 38, SSD1306_WHITE);
 
-  // Steps
   display.setTextSize(1);
   display.setCursor(0, 42);
   display.print("Steps: ");
   display.print(stepCount);
 
-  // Heart rate
   display.setCursor(0, 54);
   display.print("HR: ");
   if (!hrSensorActive) {
@@ -435,7 +432,12 @@ void drawWatchFace() {
     display.print(" bpm");
   }
 
-  // Battery indicator top right
+  // Small "*" while a sync is in progress
+  if (syncState != SYNC_IDLE) {
+    display.setCursor(88, 54);
+    display.print("*");
+  }
+
   display.setCursor(100, 54);
   display.print(batteryPercent);
   display.print("%");
@@ -527,27 +529,18 @@ void drawBatteryScreen() {
   display.printf("X:   %.3f g\n", ax);
   display.printf("Y:   %.3f g\n", ay);
 
-  // Show time sync age
-  unsigned long syncAge = (millis() - lastNTPSync) / 1000;
   display.setCursor(0, 52);
-  if (lastNTPSync == 0) {
+  if (syncState == SYNC_WIFI_CONNECTING) {
+    display.print("NTP: WiFi...");
+  } else if (syncState == SYNC_NTP_WAITING) {
+    display.print("NTP: syncing...");
+  } else if (lastNTPSync == 0) {
     display.print("NTP: never synced");
   } else {
-    display.printf("NTP: %lus ago", syncAge);
+    display.printf("NTP: %lus ago", (millis() - lastNTPSync) / 1000);
   }
 
   display.display();
-}
-
-// ─────────────────────────────────────────
-//  Periodic NTP re-sync (every 24 hours)
-// ─────────────────────────────────────────
-void checkNTPResync() {
-  if (lastNTPSync == 0) return;  // never synced — don't try silently
-  if (millis() - lastNTPSync < NTP_RESYNC_INTERVAL) return;
-
-  Serial.println("24h NTP re-sync...");
-  syncTimeFromNTP();
 }
 
 // ─────────────────────────────────────────
@@ -556,15 +549,12 @@ void checkNTPResync() {
 void setup() {
   Serial.begin(115200);
 
-  // I2C on ESP32-S3 PCB pins
   Wire.begin(SDA_PIN, SCL_PIN);
-  Wire.setClock(400000);  // 400kHz fast mode
+  Wire.setClock(400000);
 
-  // MAX30102 power gate — start OFF
   pinMode(MAX30102_EN_PIN, OUTPUT);
   digitalWrite(MAX30102_EN_PIN, LOW);
 
-  // Button
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   // ── OLED ──
@@ -599,11 +589,9 @@ void setup() {
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
   Serial.println("MPU-6500 ready at 0x69");
 
-  // ── NTP time sync ──
-  // Internal RTC only — no external RTC chip on PCB
-  syncTimeFromNTP();
+  // ── Time sync: kick it off, but do NOT wait for it ──
+  startTimeSync();
 
-  // ── Initial battery reading ──
   updateBatteryPercent();
 
   Serial.println("FitWatch boot complete.");
@@ -622,14 +610,16 @@ void loop() {
     currentScreen = (currentScreen + 1) % 4;
     delay(50);  // debounce
 
-    // Power gate MAX30102 based on screen
     if (currentScreen == 2 || currentScreen == 0) {
-      enableHeartSensor();   // screen 2 = heart rate → power on
+      enableHeartSensor();
     } else if (prevScreen == 2 || currentScreen == 0) {
-      disableHeartSensor();  // leaving screen 2 → power off
+      disableHeartSensor();
     }
   }
   lastButtonState = buttonState;
+
+  // ── Time sync state machine (never blocks) ──
+  updateTimeSync();
 
   // ── Step detection — every loop ──
   detectStep();
@@ -640,9 +630,6 @@ void loop() {
   // ── Midnight reset ──
   checkMidnightReset();
 
-  // ── NTP re-sync check ──
-  checkNTPResync();
-
   // ── Battery update every 60 seconds ──
   static unsigned long lastBatUpdate = 0;
   if (millis() - lastBatUpdate > 60000) {
@@ -650,15 +637,15 @@ void loop() {
     updateBatteryPercent();
   }
 
-  // ── Display update every 200ms (non-blocking) ──
+  // ── Display update every 200ms ──
   static unsigned long lastDisplay = 0;
   if (millis() - lastDisplay > 200) {
     lastDisplay = millis();
     switch (currentScreen) {
-      case 0: drawWatchFace();      break;
-      case 1: drawStepsScreen();    break;
+      case 0: drawWatchFace();       break;
+      case 1: drawStepsScreen();     break;
       case 2: drawHeartRateScreen(); break;
-      case 3: drawBatteryScreen();  break;
+      case 3: drawBatteryScreen();   break;
     }
   }
 }
